@@ -29,6 +29,15 @@
 #   CERT_SNI=www.bing.com       # name in the self-signed cert (anytls/trojan/hy2/tuic)
 #   HY2_HOP=                    # empty disables Hysteria2 port hopping
 #   OUT_FILE=./clash-singbox-<host>.yaml
+#   SUBSCRIPTION=1  SUB_PORT=2096   # HTTPS subscription server on the VPS (0 = off)
+#
+# Subscription: the VPS serves the generated profile at a secret URL
+#   https://<host>:2096/<token>/clash   (Clash Verge / mihomo profile)
+#   https://<host>:2096/<token>/v2ray   (base64 share links: v2rayN, NekoBox, ...)
+# The token is kept in client.env, so the URL survives re-runs, and every
+# re-run refreshes what it serves. The cert is self-signed: in Clash Verge
+# enable "Accept invalid certs", and "Use Clash proxy" for updates in case
+# the GFW blocks TCP to the VPS.
 #
 # Re-running is safe: credentials are kept in /etc/sing-box/client.env on the
 # VPS, so existing clients keep working. If the VPS was set up with
@@ -51,11 +60,13 @@ SS_PORT="${SS_PORT:-8388}"
 HY2_PORT="${HY2_PORT:-443}"
 HY2_HOP="${HY2_HOP-20000-50000}"
 TUIC_PORT="${TUIC_PORT:-8443}"
+SUBSCRIPTION="${SUBSCRIPTION:-1}"
+SUB_PORT="${SUB_PORT:-2096}"
 
 ALL_PROTOCOLS="vless-reality anytls trojan shadowtls hysteria2 tuic ss"
 
 STEP=0
-TOTAL=5
+TOTAL=6
 step() { STEP=$((STEP + 1)); printf '\n\033[1;32m==> [%d/%d] %s\033[0m\n' "$STEP" "$TOTAL" "$*"; }
 info() { printf '    %s\n' "$*"; }
 die()  { printf '\n\033[1;31mERROR: %s\033[0m\n' "$*" >&2; exit 1; }
@@ -75,7 +86,8 @@ done
 [ -n "$PROTOCOLS" ] || die "PROTOCOLS is empty"
 has() { case ",$PROTOCOLS," in *",$1,"*) return 0 ;; esac; return 1; }
 
-for v in VLESS_PORT ANYTLS_PORT TROJAN_PORT SHADOWTLS_PORT SS_PORT HY2_PORT TUIC_PORT VPS_SSH_PORT; do
+case "$SUBSCRIPTION" in 0|1) ;; *) die "SUBSCRIPTION must be 0 or 1" ;; esac
+for v in VLESS_PORT ANYTLS_PORT TROJAN_PORT SHADOWTLS_PORT SS_PORT HY2_PORT TUIC_PORT SUB_PORT VPS_SSH_PORT; do
     [[ "${!v}" =~ ^[0-9]+$ ]] && [ "${!v}" -ge 1 ] && [ "${!v}" -le 65535 ] || die "$v='${!v}' is not a port"
 done
 for v in REALITY_SNI CERT_SNI; do
@@ -107,6 +119,7 @@ has shadowtls     && claim shadowtls tcp "$SHADOWTLS_PORT"
 has ss            && claim ss tcp "$SS_PORT" && claim ss udp "$SS_PORT"
 has hysteria2     && claim hysteria2 udp "$HY2_PORT"
 has tuic          && claim tuic udp "$TUIC_PORT"
+[ "$SUBSCRIPTION" = 1 ] && claim subscription tcp "$SUB_PORT"
 
 while [ -z "$VPS_HOST" ]; do
     read -r -p "    VPS IP address (or hostname): " VPS_HOST
@@ -143,7 +156,7 @@ step "Installing and configuring sing-box on the VPS"
 REMOTE_ENV="SB_VER=$SING_BOX_VERSION PROTOCOLS=$PROTOCOLS REALITY_SNI=$REALITY_SNI CERT_SNI=$CERT_SNI"
 REMOTE_ENV+=" VLESS_PORT=$VLESS_PORT ANYTLS_PORT=$ANYTLS_PORT TROJAN_PORT=$TROJAN_PORT"
 REMOTE_ENV+=" SHADOWTLS_PORT=$SHADOWTLS_PORT SS_PORT=$SS_PORT HY2_PORT=$HY2_PORT TUIC_PORT=$TUIC_PORT"
-REMOTE_ENV+=" HOP_LO=$HOP_LO HOP_HI=$HOP_HI"
+REMOTE_ENV+=" HOP_LO=$HOP_LO HOP_HI=$HOP_HI SUBSCRIPTION=$SUBSCRIPTION SUB_PORT=$SUB_PORT SUB_NAME=sing-box-$VPS_HOST"
 "${SSH_CMD[@]}" "${VPS_USER}@${VPS_HOST}" "env $REMOTE_ENV bash -s" \
     <<'REMOTE' 2>&1 | tee "$LOG" | grep -v '^@@KV '
 set -euo pipefail
@@ -152,7 +165,7 @@ rinfo() { printf '             %s\n' "$*"; }
 rwarn() { printf '\033[1;33m             WARNING: %s\033[0m\n' "$*"; }
 rdie()  { printf '\033[1;31m    [remote] ERROR: %s\033[0m\n' "$*"; exit 1; }
 has() { case ",$PROTOCOLS," in *",$1,"*) return 0 ;; esac; return 1; }
-need_cert() { has anytls || has trojan || has hysteria2 || has tuic; }
+need_cert() { has anytls || has trojan || has hysteria2 || has tuic || [ "$SUBSCRIPTION" = 1 ]; }
 
 SB=/usr/local/bin/sing-box
 ETC=/etc/sing-box
@@ -173,6 +186,7 @@ rinfo "${OS_NAME}, $(uname -m), kernel $(uname -r)"
 rstep "2/9 Installing dependencies (curl tar openssl nftables)"
 PKGS="curl tar openssl ca-certificates"
 [ -n "$HOP_LO" ] && PKGS="$PKGS nftables"
+[ "$SUBSCRIPTION" = 1 ] && PKGS="$PKGS python3"
 if command -v apt-get >/dev/null; then
     export DEBIAN_FRONTEND=noninteractive
     apt-get update -qq >/dev/null
@@ -205,7 +219,7 @@ install -d -m 755 "$ETC"
 STATE="$ETC/client.env"
 VLESS_UUID=""; REALITY_PRIVATE_KEY=""; REALITY_PUBLIC_KEY=""; REALITY_SHORT_ID=""
 ANYTLS_PASSWORD=""; TROJAN_PASSWORD=""; SHADOWTLS_PASSWORD=""; SS_PASSWORD=""
-HY2_PASSWORD=""; TUIC_UUID=""; TUIC_PASSWORD=""
+HY2_PASSWORD=""; TUIC_UUID=""; TUIC_PASSWORD=""; SUB_TOKEN=""
 if [ -f "$STATE" ]; then
     . "$STATE"
     rinfo "reusing credentials from $STATE (existing clients keep working)"
@@ -235,6 +249,7 @@ fi
 [ -n "$HY2_PASSWORD" ]       || HY2_PASSWORD="$(rhex)"
 [ -n "$TUIC_UUID" ]          || TUIC_UUID="$($SB generate uuid)"
 [ -n "$TUIC_PASSWORD" ]      || TUIC_PASSWORD="$(rhex)"
+[ -n "$SUB_TOKEN" ]          || SUB_TOKEN="$(openssl rand -hex 24)"
 umask 077
 cat > "$STATE" <<EOF
 VLESS_UUID=$VLESS_UUID
@@ -248,6 +263,7 @@ SS_PASSWORD=$SS_PASSWORD
 HY2_PASSWORD=$HY2_PASSWORD
 TUIC_UUID=$TUIC_UUID
 TUIC_PASSWORD=$TUIC_PASSWORD
+SUB_TOKEN=$SUB_TOKEN
 EOF
 umask 022
 rinfo "saved to $STATE"
@@ -349,6 +365,7 @@ has shadowtls     && PORTS+=("tcp $SHADOWTLS_PORT" "tcp $STLS_INNER_PORT")
 has ss            && PORTS+=("tcp $SS_PORT" "udp $SS_PORT")
 has hysteria2     && PORTS+=("udp $HY2_PORT")
 has tuic          && PORTS+=("udp $TUIC_PORT")
+[ "$SUBSCRIPTION" = 1 ] && PORTS+=("tcp $SUB_PORT")
 for e in "${PORTS[@]}"; do
     set -- $e
     flag=-lntp; [ "$1" = udp ] && flag=-lnup
@@ -356,6 +373,7 @@ for e in "${PORTS[@]}"; do
     [ -n "$pid" ] || continue
     comm="$(cat /proc/$pid/comm 2>/dev/null || true)"
     unit="$(ps -o unit= -p "$pid" 2>/dev/null | tr -d ' ' || true)"
+    [ "$unit" = sing-box-sub.service ] && continue   # our own subscription server
     case "$comm" in
         sing-box) ;;
         xray|hysteria)
@@ -464,6 +482,139 @@ fi
 rinfo "sing-box.service is active, listening:"
 ss -H -lntup 2>/dev/null | grep '"sing-box"' | awk '{printf "             %-4s %s\n", $1, $5}'
 
+if [ "$SUBSCRIPTION" = 1 ]; then
+    # Tiny HTTPS server for the subscription. Only /<token>/clash and
+    # /<token>/v2ray answer; anything else gets an nginx-style 404. The files
+    # in $ETC/sub/ are uploaded by the local half of deploy_singbox.sh.
+    cat > "$ETC/sub_server.py" <<'PYEOF'
+#!/usr/bin/env python3
+"""HTTPS subscription server installed by deploy_singbox.sh."""
+import hmac, http.server, os, socket, socketserver, ssl, urllib.parse
+
+PORT = int(os.environ["SUB_PORT"])
+TOKEN = os.environ["SUB_TOKEN"].encode()
+DIR = os.environ.get("SUB_DIR", "/etc/sing-box/sub")
+NAME = os.environ.get("SUB_NAME", "sing-box")
+FILES = {
+    "clash": ("clash.yaml", "text/yaml; charset=utf-8", ".yaml"),
+    "v2ray": ("v2ray.txt", "text/plain; charset=utf-8", ".txt"),
+}
+NOT_FOUND = (b"<html>\r\n<head><title>404 Not Found</title></head>\r\n<body>\r\n"
+             b"<center><h1>404 Not Found</h1></center>\r\n<hr><center>nginx</center>\r\n"
+             b"</body>\r\n</html>\r\n")
+
+
+class Handler(http.server.BaseHTTPRequestHandler):
+    timeout = 20
+
+    def version_string(self):
+        return "nginx"
+
+    def log_message(self, fmt, *args):
+        pass
+
+    def send(self, code, ctype, body, extra=()):
+        self.send_response(code)
+        self.send_header("Content-Type", ctype)
+        self.send_header("Content-Length", str(len(body)))
+        for k, v in extra:
+            self.send_header(k, v)
+        self.end_headers()
+        if self.command != "HEAD":
+            self.wfile.write(body)
+
+    def do_GET(self):
+        parts = urllib.parse.urlsplit(self.path).path.strip("/").split("/")
+        if (len(parts) == 2 and parts[1] in FILES
+                and hmac.compare_digest(parts[0].encode(), TOKEN)):
+            fname, ctype, ext = FILES[parts[1]]
+            try:
+                with open(os.path.join(DIR, fname), "rb") as f:
+                    body = f.read()
+            except OSError:
+                body = None
+            if body is not None:
+                return self.send(200, ctype, body, (
+                    ("Content-Disposition",
+                     "attachment; filename*=UTF-8''" + urllib.parse.quote(NAME + ext)),
+                    ("profile-update-interval", "24"),
+                    ("Cache-Control", "no-store")))
+        self.send(404, "text/html", NOT_FOUND)
+
+    do_HEAD = do_GET
+
+
+class Server(socketserver.ThreadingMixIn, http.server.HTTPServer):
+    daemon_threads = True
+    allow_reuse_address = True
+
+    def handle_error(self, request, client_address):
+        pass  # failed TLS handshakes from scanners are not worth logging
+
+
+def make_server():
+    try:
+        Server.address_family = socket.AF_INET6
+        srv = Server(("::", PORT), Handler, bind_and_activate=False)
+        srv.socket.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 0)
+    except OSError:  # no IPv6 on this host
+        Server.address_family = socket.AF_INET
+        srv = Server(("0.0.0.0", PORT), Handler, bind_and_activate=False)
+    srv.server_bind()
+    srv.server_activate()
+    ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    ctx.minimum_version = ssl.TLSVersion.TLSv1_2
+    ctx.load_cert_chain(os.environ["SUB_CERT"], os.environ["SUB_KEY"])
+    # Handshake lazily in the per-connection thread, so a stalled client
+    # cannot block accept().
+    srv.socket = ctx.wrap_socket(srv.socket, server_side=True, do_handshake_on_connect=False)
+    return srv
+
+
+make_server().serve_forever()
+PYEOF
+    install -d -m 750 -g sing-box "$ETC/sub"
+    umask 027
+    cat > "$ETC/sub.env" <<EOF
+SUB_PORT=$SUB_PORT
+SUB_TOKEN=$SUB_TOKEN
+SUB_DIR=$ETC/sub
+SUB_NAME=$SUB_NAME
+SUB_CERT=$ETC/cert.pem
+SUB_KEY=$ETC/key.pem
+EOF
+    umask 022
+    chgrp sing-box "$ETC/sub.env"; chmod 640 "$ETC/sub.env"; chmod 644 "$ETC/sub_server.py"
+    cat > /etc/systemd/system/sing-box-sub.service <<EOF
+[Unit]
+Description=sing-box subscription server (https :${SUB_PORT})
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=sing-box
+Group=sing-box
+EnvironmentFile=$ETC/sub.env
+ExecStart=$(command -v python3) $ETC/sub_server.py
+NoNewPrivileges=true
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+EOF
+    systemctl daemon-reload
+    systemctl enable sing-box-sub >/dev/null 2>&1
+    systemctl restart sing-box-sub
+    sleep 1
+    systemctl is-active --quiet sing-box-sub ||
+        { journalctl -u sing-box-sub -n 20 --no-pager; rdie "subscription server failed to start"; }
+    rinfo "subscription server is active on tcp ${SUB_PORT} (sing-box-sub.service)"
+elif [ -f /etc/systemd/system/sing-box-sub.service ]; then
+    systemctl disable --now sing-box-sub >/dev/null 2>&1 || true
+    rinfo "SUBSCRIPTION=0: stopped sing-box-sub.service"
+fi
+
 rstep "9/9 Self-test: a sing-box client on the VPS -> each protocol -> internet"
 TLS_INSECURE="\"enabled\": true, \"server_name\": \"${CERT_SNI}\", \"insecure\": true"
 OUT=(); RULES=(); MIXED=(); NAMES=()
@@ -529,14 +680,14 @@ if [ -n "$FAILED" ]; then
 fi
 
 for v in VLESS_UUID REALITY_PUBLIC_KEY REALITY_SHORT_ID ANYTLS_PASSWORD TROJAN_PASSWORD \
-         SHADOWTLS_PASSWORD SS_PASSWORD HY2_PASSWORD TUIC_UUID TUIC_PASSWORD; do
+         SHADOWTLS_PASSWORD SS_PASSWORD HY2_PASSWORD TUIC_UUID TUIC_PASSWORD SUB_TOKEN; do
     echo "@@KV $v=${!v}"
 done
 REMOTE
 
 kv() { grep "^@@KV $1=" "$LOG" | tail -1 | cut -d= -f2- | tr -d '\r'; }
 for v in VLESS_UUID REALITY_PUBLIC_KEY REALITY_SHORT_ID ANYTLS_PASSWORD TROJAN_PASSWORD \
-         SHADOWTLS_PASSWORD SS_PASSWORD HY2_PASSWORD TUIC_UUID TUIC_PASSWORD; do
+         SHADOWTLS_PASSWORD SS_PASSWORD HY2_PASSWORD TUIC_UUID TUIC_PASSWORD SUB_TOKEN; do
     printf -v "$v" '%s' "$(kv "$v")"
     [ -n "${!v}" ] || die "remote install did not return credentials (see output above)"
 done
@@ -700,12 +851,57 @@ has anytls && LINKS+=("anytls://${ANYTLS_PASSWORD}@${H}:${ANYTLS_PORT}?sni=${CER
 has trojan && LINKS+=("trojan://${TROJAN_PASSWORD}@${H}:${TROJAN_PORT}?security=tls&sni=${CERT_SNI}&allowInsecure=1&type=tcp#trojan-${H}")
 has ss && LINKS+=("ss://2022-blake3-aes-128-gcm:$(urlenc "$SS_PASSWORD")@${H}:${SS_PORT}#ss-${H}")
 
+# --------------------------------------------------------------------------
+step "Publishing the subscription"
+SUB_BASE="https://${H}:${SUB_PORT}/${SUB_TOKEN}"
+if [ "$SUBSCRIPTION" = 1 ]; then
+    upload() { # local-file remote-name
+        "${SSH_CMD[@]}" "${VPS_USER}@${VPS_HOST}" \
+            "set -e; d=/etc/sing-box/sub; umask 027; cat > \$d/.$2.tmp; chgrp sing-box \$d/.$2.tmp; mv -f \$d/.$2.tmp \$d/$2" <"$1"
+    }
+    V2RAY_FILE="$(mktemp)"
+    printf '%s\n' "${LINKS[@]}" | base64 | tr -d '\n' >"$V2RAY_FILE"
+    upload "$OUT_FILE" clash.yaml && upload "$V2RAY_FILE" v2ray.txt ||
+        { rm -f "$V2RAY_FILE"; die "uploading the subscription files failed"; }
+    rm -f "$V2RAY_FILE"
+    # Check on the VPS itself (always possible) and from here (may be blocked).
+    ON_VPS="$("${SSH_CMD[@]}" "${VPS_USER}@${VPS_HOST}" \
+        "curl -sk -m 10 -o /dev/null -w '%{http_code}' https://127.0.0.1:${SUB_PORT}/${SUB_TOKEN}/clash;
+         printf ' '; curl -sk -m 10 -o /dev/null -w '%{http_code}' https://127.0.0.1:${SUB_PORT}/wrong/clash" || true)"
+    [ "$ON_VPS" = "200 404" ] || die "subscription self-check on the VPS failed (got '$ON_VPS', want '200 404')"
+    info "on the VPS: subscription 200, wrong path 404"
+    FROM_HERE="$(curl -sk -m 10 -o /dev/null -w '%{http_code}' "${SUB_BASE}/clash" || true)"
+    if [ "$FROM_HERE" = 200 ]; then
+        info "from here: ${SUB_BASE%/*}/<token>/clash -> 200"
+    else
+        info "WARNING: subscription not reachable from here (HTTP ${FROM_HERE:-none}); provider firewall"
+        info "or GFW TCP block. Clients can still update it through an already-working node."
+    fi
+else
+    info "SUBSCRIPTION=0: skipped"
+fi
+
 printf '\n\033[1;32m========== Clash Verge profile (%s) ==========\033[0m\n' "$OUT_FILE"
 cat "$OUT_FILE"
 printf '\033[1;32m===============================================================\033[0m\n'
+if [ "$SUBSCRIPTION" = 1 ]; then
+    cat <<EOF
+
+Subscription URLs (keep them secret -- they contain every credential):
+  Clash Verge / mihomo : ${SUB_BASE}/clash
+  v2rayN / NekoBox     : ${SUB_BASE}/v2ray
+
+Import the subscription into Clash Verge (Rev):
+  Profiles -> New -> Type "Remote" -> paste the Clash URL, then turn on
+    * "Accept Invalid Certs (Danger)"  -- the VPS uses a self-signed certificate
+    * "Use Clash Proxy"                -- updates still work if the GFW blocks TCP to the VPS
+  -> Save, click the profile to activate it, turn on System Proxy.
+  It refreshes every 24 h; re-running this script updates what it serves.
+EOF
+fi
 cat <<EOF
 
-Import into Clash Verge:
+Or import the file instead:
   Profiles -> New -> Type "Local" -> select ${OUT_FILE} -> Save,
   then click the profile to activate it and turn on System Proxy.
   Keep the mode on "Rule" so Chinese sites go DIRECT, not through the VPS.
@@ -716,6 +912,6 @@ for l in "${LINKS[@]}"; do printf '  %s\n' "$l"; done
 has shadowtls && echo "  (ShadowTLS has no standard share link; use the Clash profile.)"
 echo
 echo "If the VPS provider has its own firewall (e.g. Vultr Firewall group, AWS security group),"
-echo "allow the ports above there too, including udp ${HOP_LO:+${HOP_LO}-${HOP_HI}, }${HY2_PORT}/${TUIC_PORT}."
+echo "allow the ports above there too, including udp ${HOP_LO:+${HOP_LO}-${HOP_HI}, }${HY2_PORT}/${TUIC_PORT}$( [ "$SUBSCRIPTION" = 1 ] && printf ' and tcp %s (subscription)' "$SUB_PORT")."
 echo
 echo "Done."
